@@ -1,11 +1,15 @@
-use std::{path::Path, process::Command, str::FromStr};
-use anyhow::{Result, anyhow};
+use std::{fmt::Display, path::Path, process::Command, str::FromStr};
+
+use anyhow::anyhow;
+use anyhow::{Error, Result};
 use clap::arg_enum;
-use reqwest::StatusCode;
-use semver::Version;
+use http_types::StatusCode;
+use semver::{Version, VersionReq};
+use smol::{fs::File, prelude::*};
 use structopt::StructOpt;
-use tempfile::{tempdir};
-use tokio::io::AsyncWriteExt;
+use tempfile::tempdir;
+
+mod http;
 
 #[derive(StructOpt)]
 struct Arg {
@@ -20,6 +24,22 @@ struct DotnetVersion {
     major: u64,
     minor: Option<u64>,
     patch: Option<u64>,
+}
+
+impl Display for DotnetVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("{}", self.major))?;
+        
+        if let Some(minor) = self.minor {
+            f.write_fmt(format_args!(".{}", minor))?;
+
+            if let Some(patch) = self.patch {
+                f.write_fmt(format_args!(".{}", patch))?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl FromStr for DotnetVersion {
@@ -65,35 +85,36 @@ arg_enum! {
 const BASE_URL: &str = "https://dotnetcli.blob.core.windows.net/dotnet";
 const CDN_URL: &str = "https://dotnetcli.azureedge.net/dotnet";
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let arg: Arg = Arg::from_args();
-    
-    let version = find_best_version(arg.runtime, arg.version).await?;
-    let product_version = find_product_version(arg.runtime, &version).await?;
+fn main() -> Result<()> {
+    smol::block_on(async {
+        let arg: Arg = Arg::from_args();
 
-    if is_installed(arg.runtime, &product_version) {
-        return Ok(());
-    }
+        if is_installed(arg.runtime, &arg.version).await? {
+            return Ok(());
+        }
 
-    let dir = tempdir()?;
-    let download_path = dir.path().join("installer.exe");
-    let mut file = tokio::fs::File::create(&download_path).await?;
-    let url = download_url(arg.runtime, version, product_version);
-    let mut response = reqwest::get(&url).await?;
+        let version = find_best_version(arg.runtime, arg.version).await?;
+        let product_version = find_product_version(arg.runtime, &version).await?;
 
-    while let Some(chunk) = response.chunk().await? {
-        file.write(&chunk).await?;
-    }
+        let dir = tempdir()?;
+        let download_path = dir.path().join("installer.exe");
+        let mut file = File::create(&download_path).await?;
+        let url = download_url(arg.runtime, version, product_version);
+        println!("{}", url);
+        let response = http::get(&url).await?;
 
-    file.flush().await?;
+        smol::io::copy(response, &mut file).await?;
+        file.flush().await?;
 
-    Command::new(download_path).arg("/norestart").status()?;
+        Command::new(download_path).arg("/norestart").status()?;
 
-    Ok(())
+        Ok(())
+    })
 }
 
-fn is_installed(runtime: Runtime, product_version: &str) -> bool {
+async fn is_installed(runtime: Runtime, dotnet_version: &DotnetVersion) -> Result<bool> {
+
+    let version_req = VersionReq::parse(&dotnet_version.to_string())?;
     let runtime_path = match runtime {
         Runtime::Dotnet => "shared\\Microsoft.NETCore.App",
         Runtime::AspCore => "shared\\Microsoft.AspNetCore.App",
@@ -101,37 +122,68 @@ fn is_installed(runtime: Runtime, product_version: &str) -> bool {
     };
 
     let root_path = Path::new("C:\\Program Files\\dotnet");
-    root_path.join(runtime_path).join(product_version).is_dir()
+    let mut entries = smol::fs::read_dir(root_path.join(runtime_path)).await?;
+    
+    while let Some(entry) = entries.try_next().await? {
+        let version = Version::parse(&entry.file_name().to_string_lossy())?;
+        let file_type = entry.file_type().await?;
+
+        if file_type.is_dir() && version_req.matches(&version) {
+            return Ok(true);
+        }
+    }
+
+    return Ok(false);
 }
 
-fn download_url(runtime: Runtime, version: Version, product_version: String) -> String {    
+fn download_url(runtime: Runtime, version: Version, product_version: String) -> String {
     match runtime {
-        Runtime::Dotnet => format!("{}/Runtime/{}/dotnet-runtime-{}-win-{}.exe", BASE_URL, version, product_version, "x64"),
-        Runtime::AspCore => format!("{}/aspnetcore/Rumtime/{}/aspnetcore-runtime-{}-win-{}.exe", BASE_URL, version, product_version, "x64"),
-        Runtime::WindowsDesktop => format!("{}/Runtime/{}/windowsdesktop-runtime-{}-win-{}.exe", BASE_URL, version, product_version, "x64")
+        Runtime::Dotnet => format!(
+            "{}/Runtime/{}/dotnet-runtime-{}-win-{}.exe",
+            BASE_URL, version, product_version, "x64"
+        ),
+        Runtime::AspCore => format!(
+            "{}/aspnetcore/Rumtime/{}/aspnetcore-runtime-{}-win-{}.exe",
+            BASE_URL, version, product_version, "x64"
+        ),
+        Runtime::WindowsDesktop => format!(
+            "{}/Runtime/{}/windowsdesktop-runtime-{}-win-{}.exe",
+            BASE_URL, version, product_version, "x64"
+        ),
     }
 }
 
 async fn find_product_version(runtime: Runtime, version: &Version) -> Result<String> {
     let url = match runtime {
-        Runtime::Dotnet | Runtime::WindowsDesktop => format!("{}/Runtime/{}/productVersion.txt", CDN_URL, version),
+        Runtime::Dotnet | Runtime::WindowsDesktop => {
+            format!("{}/Runtime/{}/productVersion.txt", CDN_URL, version)
+        }
         Runtime::AspCore => format!("{}/aspnetcore/Runtime{}", BASE_URL, version),
     };
 
-    let response = reqwest::get(&url).await?;
-
-    if response.status() == StatusCode::OK {
-        Ok(response.text().await?.trim().to_string())
+    let mut response = http::get(&url).await?;
+    if response.status() == StatusCode::Ok {
+        Ok(response
+            .body_string()
+            .await
+            .map_err(Error::msg)?
+            .trim()
+            .to_string())
     } else {
         Ok(version.to_string())
     }
 }
 
 async fn find_best_version(runtime: Runtime, version: DotnetVersion) -> Result<Version> {
-    if let DotnetVersion{major, minor: Some(minor), patch: Some(patch)} = version {
+    if let DotnetVersion {
+        major,
+        minor: Some(minor),
+        patch: Some(patch),
+    } = version
+    {
         return Ok(Version::new(major, minor, patch));
     }
-    
+
     let url = match runtime {
         Runtime::Dotnet | Runtime::WindowsDesktop => format!("{}/Runtime", BASE_URL),
         Runtime::AspCore => format!("{}/aspnetcore/Rumtime", BASE_URL),
@@ -145,27 +197,34 @@ async fn find_best_version(runtime: Runtime, version: DotnetVersion) -> Result<V
 
     let full_url = format!("{}/{}.{}/latest.version", url, version.major, minor);
 
-    let version_text = reqwest::get(&full_url).await?.text().await?;
+    let version_text = http::get(&full_url)
+        .await?
+        .body_string()
+        .await
+        .map_err(Error::msg)?;
 
     if let Some(version_text) = version_text.lines().last() {
         Ok(Version::from_str(version_text)?)
     } else {
-        Err(anyhow!("version file did not contain expected version text"))
+        Err(anyhow!(
+            "version file did not contain expected version text"
+        ))
     }
 }
 
 async fn find_newest_minor(url: &str, major_version: u64) -> Result<u64> {
-    let client = reqwest::Client::new();
     for minor in 0.. {
         let full_url = format!("{}/{}.{}/latest.version", url, major_version, minor);
-        if StatusCode::NOT_FOUND == client.get(&full_url).send().await?.status() {
+        let response = http::get(&full_url).await?;
+        if StatusCode::NotFound == response.status() {
             if minor > 0 {
                 return Ok(minor - 1);
             } else {
-                return Err(anyhow!("No available versions found"))
+                return Err(anyhow!("No available versions found"));
             }
         }
     }
 
     unreachable!();
 }
+
