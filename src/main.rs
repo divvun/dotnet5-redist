@@ -99,16 +99,20 @@ fn main() -> Result<()> {
         let dir = tempdir()?;
         let download_path = dir.path().join("installer.exe");
         let mut file = File::create(&download_path).await?;
-        let url = download_url(arg.runtime, version, product_version);
-        println!("{}", url);
+        let url = download_url(arg.runtime, version, &product_version);
         let response = http::get(&url).await?;
 
-        smol::io::copy(response, &mut file).await?;
-        file.flush().await?;
-
-        Command::new(download_path).arg("/norestart").status()?;
-
-        Ok(())
+        if response.status() == StatusCode::Ok {
+            smol::io::copy(response, &mut file).await?;
+            file.flush().await?;
+            std::mem::drop(file);
+            Command::new(download_path).arg("/norestart").arg("/quiet").status()?;
+            Ok(())
+        } else if response.status() == StatusCode::NotFound{
+            Err(anyhow!("requested dotnet version does not exist"))
+        } else {
+            Err(anyhow!("failed to download dotnet version {}", product_version))
+        }
     })
 }
 
@@ -136,14 +140,14 @@ async fn is_installed(runtime: Runtime, dotnet_version: &DotnetVersion) -> Resul
     return Ok(false);
 }
 
-fn download_url(runtime: Runtime, version: Version, product_version: String) -> String {
+fn download_url(runtime: Runtime, version: Version, product_version: &str) -> String {
     match runtime {
         Runtime::Dotnet => format!(
             "{}/Runtime/{}/dotnet-runtime-{}-win-{}.exe",
             BASE_URL, version, product_version, "x64"
         ),
         Runtime::AspCore => format!(
-            "{}/aspnetcore/Rumtime/{}/aspnetcore-runtime-{}-win-{}.exe",
+            "{}/aspnetcore/Runtime/{}/aspnetcore-runtime-{}-win-{}.exe",
             BASE_URL, version, product_version, "x64"
         ),
         Runtime::WindowsDesktop => format!(
@@ -186,7 +190,7 @@ async fn find_best_version(runtime: Runtime, version: DotnetVersion) -> Result<V
 
     let url = match runtime {
         Runtime::Dotnet | Runtime::WindowsDesktop => format!("{}/Runtime", BASE_URL),
-        Runtime::AspCore => format!("{}/aspnetcore/Rumtime", BASE_URL),
+        Runtime::AspCore => format!("{}/aspnetcore/Runtime", BASE_URL),
     };
 
     let minor = if let Some(minor) = version.minor {
@@ -196,7 +200,6 @@ async fn find_best_version(runtime: Runtime, version: DotnetVersion) -> Result<V
     };
 
     let full_url = format!("{}/{}.{}/latest.version", url, version.major, minor);
-
     let version_text = http::get(&full_url)
         .await?
         .body_string()
