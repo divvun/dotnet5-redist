@@ -65,6 +65,6 @@ jobs:
         platform: windows
         version: ${{ steps.version.outputs.version }}
         payload-path: ${{ steps.package.outputs['txz-path'] }}
-        repo: https://pahkat.uit.no/devtools/
+        repo: https://pahkat.thetc.se/devtools/
         channel: ${{ steps.version.outputs.channel }}
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
