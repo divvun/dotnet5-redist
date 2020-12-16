@@ -1,6 +1,6 @@
 use std::{fmt::Display, path::Path, process::Command, str::FromStr};
 
-use anyhow::anyhow;
+use anyhow::{anyhow, bail};
 use anyhow::{Error, Result};
 use clap::arg_enum;
 use http_types::StatusCode;
@@ -17,6 +17,9 @@ struct Arg {
     version: DotnetVersion,
     #[structopt(short, long, possible_values = &Runtime::variants(), case_insensitive = true)]
     runtime: Runtime,
+    #[structopt(short, long, possible_values = &Architecture::variants(), case_insensitive = true)]
+    arch: Architecture,
+
 }
 
 #[derive(Copy, Clone)]
@@ -82,6 +85,14 @@ arg_enum! {
     }
 }
 
+arg_enum! {
+    #[derive(Copy, Clone, PartialEq, Eq)]
+    enum Architecture {
+        X86,
+        X64,
+    }
+}
+
 const BASE_URL: &str = "https://dotnetcli.blob.core.windows.net/dotnet";
 const CDN_URL: &str = "https://dotnetcli.azureedge.net/dotnet";
 
@@ -89,7 +100,11 @@ fn main() -> Result<()> {
     smol::block_on(async {
         let arg: Arg = Arg::from_args();
 
-        if is_installed(arg.runtime, &arg.version).await? {
+        if arg.arch == Architecture::X64 && !is_64bit_os() {
+            bail!("Cannot install 64-bit dotnet on 32-bit windows");
+        }
+
+        if is_installed(arg.arch, arg.runtime, &arg.version).await? {
             return Ok(());
         }
 
@@ -99,7 +114,7 @@ fn main() -> Result<()> {
         let dir = tempdir()?;
         let download_path = dir.path().join("installer.exe");
         let mut file = File::create(&download_path).await?;
-        let url = download_url(arg.runtime, version, &product_version);
+        let url = download_url(arg.arch, arg.runtime, version, &product_version);
         let response = http::get(&url).await?;
 
         if response.status() == StatusCode::Ok {
@@ -116,7 +131,7 @@ fn main() -> Result<()> {
     })
 }
 
-async fn is_installed(runtime: Runtime, dotnet_version: &DotnetVersion) -> Result<bool> {
+async fn is_installed(arch: Architecture, runtime: Runtime, dotnet_version: &DotnetVersion) -> Result<bool> {
 
     let version_req = VersionReq::parse(&dotnet_version.to_string())?;
     let runtime_path = match runtime {
@@ -125,7 +140,7 @@ async fn is_installed(runtime: Runtime, dotnet_version: &DotnetVersion) -> Resul
         Runtime::WindowsDesktop => "shared\\Microsoft.WindowsDesktop.App",
     };
 
-    let root_path = Path::new("C:\\Program Files\\dotnet");
+    let root_path = get_root_install(arch);
     let mut entries = smol::fs::read_dir(root_path.join(runtime_path)).await?;
     
     while let Some(entry) = entries.try_next().await? {
@@ -140,19 +155,24 @@ async fn is_installed(runtime: Runtime, dotnet_version: &DotnetVersion) -> Resul
     return Ok(false);
 }
 
-fn download_url(runtime: Runtime, version: Version, product_version: &str) -> String {
+fn download_url(arch: Architecture, runtime: Runtime, version: Version, product_version: &str) -> String {
+    let arch = match arch {
+        Architecture::X86 => "x86",
+        Architecture::X64 => "x64",
+    };
+
     match runtime {
         Runtime::Dotnet => format!(
             "{}/Runtime/{}/dotnet-runtime-{}-win-{}.exe",
-            BASE_URL, version, product_version, "x64"
+            BASE_URL, version, product_version, arch
         ),
         Runtime::AspCore => format!(
             "{}/aspnetcore/Runtime/{}/aspnetcore-runtime-{}-win-{}.exe",
-            BASE_URL, version, product_version, "x64"
+            BASE_URL, version, product_version, arch
         ),
         Runtime::WindowsDesktop => format!(
             "{}/Runtime/{}/windowsdesktop-runtime-{}-win-{}.exe",
-            BASE_URL, version, product_version, "x64"
+            BASE_URL, version, product_version, arch
         ),
     }
 }
@@ -231,3 +251,14 @@ async fn find_newest_minor(url: &str, major_version: u64) -> Result<u64> {
     unreachable!();
 }
 
+fn get_root_install(arch: Architecture) -> &'static Path {
+    match (arch, is_64bit_os()) {
+        (Architecture::X64, true) | (Architecture::X86, false) => Path::new("C:\\Program Files\\dotnet"),
+        (Architecture::X86, true) => Path::new("C:\\Program Files (x86)\\dotnet"),
+        _ => unreachable!()
+    }
+}
+
+fn is_64bit_os() -> bool {
+    std::env::var_os("PROCESSOR_ARCHITEW6432").is_some() || std::env::consts::ARCH == "x86_64"
+}
