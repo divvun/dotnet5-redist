@@ -104,31 +104,42 @@ fn main() -> Result<()> {
             bail!("Cannot install 64-bit dotnet on 32-bit windows");
         }
 
-        if is_installed(arg.arch, arg.runtime, &arg.version).await? {
-            return Ok(());
+        if !is_vcruntime_installed(arg.arch) {
+            let url = match arg.arch {
+                Architecture::X86 => "https://download.visualstudio.microsoft.com/download/pr/8ecb9800-52fd-432d-83ee-d6e037e96cc2/50A3E92ADE4C2D8F310A2812D46322459104039B9DEADBD7FDD483B5C697C0C8/VC_redist.x86.exe",
+                Architecture::X64 => "https://download.visualstudio.microsoft.com/download/pr/89a3b9df-4a09-492e-8474-8f92c115c51d/B1A32C71A6B7D5978904FB223763263EA5A7EB23B2C44A0D60E90D234AD99178/VC_redist.x64.exe",
+            };
+
+            download_install(url).await?;
         }
 
-        let version = find_best_version(arg.runtime, arg.version).await?;
-        let product_version = find_product_version(arg.runtime, &version).await?;
+        if !is_installed(arg.arch, arg.runtime, &arg.version).await? {
+            let version = find_best_version(arg.runtime, arg.version).await?;
+            let product_version = find_product_version(arg.runtime, &version).await?;
 
-        let dir = tempdir()?;
-        let download_path = dir.path().join("installer.exe");
-        let mut file = File::create(&download_path).await?;
-        let url = download_url(arg.arch, arg.runtime, version, &product_version);
-        let response = http::get(&url).await?;
-
-        if response.status() == StatusCode::Ok {
-            smol::io::copy(response, &mut file).await?;
-            file.flush().await?;
-            std::mem::drop(file);
-            Command::new(download_path).arg("/norestart").arg("/quiet").status()?;
-            Ok(())
-        } else if response.status() == StatusCode::NotFound{
-            Err(anyhow!("requested dotnet version does not exist"))
-        } else {
-            Err(anyhow!("failed to download dotnet version {}", product_version))
+            let url = download_url(arg.arch, arg.runtime, version, &product_version);
+            download_install(&url).await?;
         }
+
+        Ok(())
     })
+}
+
+async fn download_install(url: &str) -> Result<()> {
+    let dir = tempdir()?;
+    let download_path = dir.path().join("installer.exe");
+    let mut file = File::create(&download_path).await?;
+    let response = http::get(&url).await?;
+
+    if response.status() == StatusCode::Ok {
+        smol::io::copy(response, &mut file).await?;
+        file.flush().await?;
+        std::mem::drop(file);
+        Command::new(download_path).arg("/norestart").arg("/quiet").status()?;
+        Ok(())
+    } else {
+        Err(anyhow!("could not download file"))
+    }
 }
 
 async fn is_installed(arch: Architecture, runtime: Runtime, dotnet_version: &DotnetVersion) -> Result<bool> {
@@ -141,6 +152,10 @@ async fn is_installed(arch: Architecture, runtime: Runtime, dotnet_version: &Dot
     };
 
     let root_path = get_root_install(arch);
+    if !root_path.exists() {
+        return Ok(false)
+    }
+
     let mut entries = smol::fs::read_dir(root_path.join(runtime_path)).await?;
     
     while let Some(entry) = entries.try_next().await? {
@@ -153,6 +168,17 @@ async fn is_installed(arch: Architecture, runtime: Runtime, dotnet_version: &Dot
     }
 
     return Ok(false);
+}
+
+fn is_vcruntime_installed(arch: Architecture) -> bool {
+    let path = match (arch, is_syswow64()) {
+        (Architecture::X64, true) => Path::new("C:\\Windows\\SysNative\\vcruntime140.dll"),
+        (Architecture::X64, false) => Path::new("C:\\Windows\\System32\\vcruntime140.dll"),
+        (Architecture::X86, true) => Path::new("C:\\Windows\\System32\\vcruntime140.dll"),
+        (Architecture::X86, false) => Path::new("C:\\Windows\\SysWOW64\\vcruntime140.dll"),
+    };
+
+    path.exists()
 }
 
 fn download_url(arch: Architecture, runtime: Runtime, version: Version, product_version: &str) -> String {
@@ -261,4 +287,8 @@ fn get_root_install(arch: Architecture) -> &'static Path {
 
 fn is_64bit_os() -> bool {
     std::env::var_os("PROCESSOR_ARCHITEW6432").is_some() || std::env::consts::ARCH == "x86_64"
+}
+
+fn is_syswow64() -> bool {
+    std::env::var_os("PROCESSOR_ARCHITEW6432").is_some()
 }
