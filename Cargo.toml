@@ -1,7 +1,7 @@
 
 [package]
 name = "dotnet5-webinst"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Zoey Riordan <zoey@dos.cafe>"]
 edition = "2018"
 
