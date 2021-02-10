@@ -196,10 +196,19 @@ fn download_url(arch: Architecture, runtime: Runtime, version: Version, product_
             "{}/aspnetcore/Runtime/{}/aspnetcore-runtime-{}-win-{}.exe",
             BASE_URL, version, product_version, arch
         ),
-        Runtime::WindowsDesktop => format!(
-            "{}/Runtime/{}/windowsdesktop-runtime-{}-win-{}.exe",
-            BASE_URL, version, product_version, arch
-        ),
+        Runtime::WindowsDesktop => {
+            if version.major >= 5 {
+                format!(
+                    "{}/WindowsDesktop/{}/windowsdesktop-runtime-{}-win-{}.exe",
+                    BASE_URL, version, product_version, arch
+                )
+            } else {
+                format!(
+                    "{}/Runtime/{}/windowsdesktop-runtime-{}-win-{}.exe",
+                    BASE_URL, version, product_version, arch
+                )
+            }
+        }
     }
 }
 
